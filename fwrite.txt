@@ -1,0 +1,300 @@
+fn fit_struct_offset<T, U>(member_offset: fn(&T) -> &U) -> usize {
+    let base: *const T = std::ptr::null();
+    let member = member_offset(unsafe { &*base });
+    member as *const U as usize
+}
+
+fn write_file_header(fp: *mut FILE) -> Result<(), std::io::Error> {
+
+    unsafe {
+        let mut file_header = FIT_FILE_HDR {
+            header_size: FIT_FILE_HDR_SIZE as u8,
+            profile_version: (FIT_PROFILE_VERSION_MAJOR * FIT_PROFILE_VERSION_SCALE + FIT_PROFILE_VERSION_MINOR) as u16,
+            protocol_version: (2 << FIT_PROTOCOL_VERSION_MAJOR_SHIFT),
+            data_type: *b".FIT",
+            data_size: 0,
+            crc: 0,
+        };
+
+        fseek(fp, 0, SEEK_END);
+
+        if ftell(fp) < 14 {
+            file_header.data_size = FIT_FILE_HDR_SIZE - 2;
+        } else {
+            file_header.data_size = ftell(fp) as u32 - FIT_FILE_HDR_SIZE - 2;
+        }
+    
+        println!("{:?} - data size", file_header.data_size);
+    
+        file_header.crc = FitCRC_Calc16(&file_header as *const FIT_FILE_HDR as *const c_void, fit_struct_offset(|hdr: &FIT_FILE_HDR| &hdr.crc) as u32);
+        println!("{:?} - header", file_header.crc);
+
+        fseek(fp, 0, SEEK_SET);
+        fwrite(&file_header as *const _ as *const c_void, size_of::<FIT_FILE_HDR>(), 1, fp);
+    }
+
+    Ok(())
+}
+
+fn write_message_definition(
+    local_mesg_number: u8,
+    mesg_def_pointer: *const u8,
+    mesg_def_size: u16,
+    fp: *mut FILE,
+) -> Result<(), std::io::Error> {
+    let header = local_mesg_number | 0x40;
+    write_data(&header as *const _ as *const c_void, FIT_HDR_SIZE as u16, fp)?;
+    write_data(mesg_def_pointer as *const c_void, mesg_def_size, fp)?;
+    Ok(())
+}
+
+// fn write_message_definition_with_dev_fields(
+//     local_mesg_number: u8,
+//     mesg_def_pointer: *const u8,
+//     mesg_def_size: u8,
+//     number_dev_fields: u8,
+//     dev_field_definitions: *const FitDevFieldDef,
+//     fp: &mut File,
+// ) -> Result<(), std::io::Error> {
+//     let header = local_mesg_number | FIT_HDR_TYPE_DEF_BIT | FIT_HDR_DEV_DATA_BIT;
+//     write_data(&header, FIT_HDR_SIZE, fp)?;
+//     write_data(mesg_def_pointer, mesg_def_size as u16, fp)?;
+
+//     write_data(&number_dev_fields, size_of::<u8>(), fp)?;
+//     for _ in 0..number_dev_fields {
+//         write_data(
+//             dev_field_definitions as *const u8,
+//             size_of::<FitDevFieldDef>(),
+//             fp,
+//         )?;
+//         // Increment dev_field_definitions pointer (unsafe)
+//         unsafe {
+//             dev_field_definitions = dev_field_definitions.offset(1);
+//         }
+//     }
+
+//     Ok(())
+// }
+
+fn write_data(data: *const c_void, data_size: u16, fp: *mut FILE) -> Result<(), std::io::Error> {
+
+    unsafe {
+        fwrite(data, 1, data_size as usize, fp);
+        
+        let mut crc_guard = DATA_CRC.lock().unwrap();
+
+        for offset in 0..data_size {
+
+            let byte_ptr = data as *const u8;    
+            let offset_ptr = byte_ptr.add(offset as usize);
+
+            *crc_guard = FitCRC_Get16(*crc_guard,  *offset_ptr);
+        }
+    }
+
+    Ok(())
+}
+
+fn write_message(
+    local_mesg_number: u8,
+    mesg_pointer: *const u8,
+    mesg_size: u16,
+    fp: *mut FILE,
+) -> Result<(), std::io::Error> {
+    write_data(&local_mesg_number as *const _ as *const c_void, FIT_HDR_SIZE as u16, fp)?;
+    write_data(mesg_pointer as *const c_void, mesg_size, fp)?;
+    Ok(())
+}
+
+// fn write_developer_field(
+//     data: *const u8,
+//     data_size: u16,
+//     fp: &mut File,
+// ) -> Result<(), std::io::Error> {
+//     write_data(data, data_size, fp)?;
+
+//     Ok(())
+// }
+
+lazy_static! {
+    static ref DATA_CRC: Arc<Mutex<u16>> = Arc::new(Mutex::new(0)); 
+}
+
+fn write_file_id_message(
+    timestamp: u32,
+    fp: *mut FILE, 
+) -> Result<(), std::io::Error> {
+    unsafe {
+        let local_mesg_number: u8 = 0;
+        let mut file_id_mesg = FIT_FILE_ID_MESG { 
+            serial_number: 1,
+            time_created: 1,
+            product_name: [2; 20],
+            manufacturer: 255,
+            product: 1,
+            number: 1,
+            type_: 4
+        };
+
+        file_id_mesg.time_created = timestamp;
+        file_id_mesg.type_ = 0;
+        file_id_mesg.manufacturer = 200; 
+    
+        write_message_definition(
+            local_mesg_number,
+            fit_mesg_defs[FIT_MESG_FIT_MESG_FILE_ID as usize] as *const u8,
+            FIT_FILE_ID_MESG_DEF_SIZE as u16,
+            fp,
+        )?;
+    
+        write_message(
+            local_mesg_number,
+            &file_id_mesg as *const _ as *const u8, // Cast to *const u8 for WriteMessage
+            size_of::<FIT_FILE_ID_MESG>() as u16,
+            fp,
+        )?;    
+    }
+
+    Ok(())
+}
+
+// fn write_device_info_mesg(
+//     timestamp: u32,
+//     fp: *mut FILE,
+// ) -> Result<(), std::io::Error> {
+//     unsafe {
+//         let name = "Echo Bike"; // Example bike name
+//         let mut bike_name: [i8; 20] = [0; 20];
+    
+//         // Convert string to bytes and copy into the array
+//         for (i, &byte) in name.as_bytes().iter().enumerate() {
+//             if i < 20 {
+//                 bike_name[i] = byte as i8;
+//             }
+//         }    
+
+//         let local_mesg_number: u8 = 0;
+//         let device_info_mesg = FIT_DEVICE_INFO_MESG {
+//             timestamp,
+//             serial_number: 1,
+//             cum_operating_time: 1,
+//             product_name: bike_name,
+//             manufacturer: 255,
+//             product: 1,
+//             software_version: 100,
+//             battery_voltage: 1,
+//             ant_device_number: 1,
+//             device_index: 1,
+//             device_type: 1,
+//             hardware_version: 1,
+//             battery_status: 1,
+//             sensor_position: 1,
+//             descriptor: [1; 1],
+//             ant_transmission_type: 1,
+//             ant_network: 1,
+//             source_type: 1,
+//         };
+    
+//         // Fit_InitMesg(fit_mesg_defs[FIT_MESG_FIT_MESG_DEVICE_INFO as usize], &mut device_info_mesg as *const FIT_DEVICE_INFO_MESG as *mut c_void);
+
+//         write_message_definition(
+//             local_mesg_number,
+//             fit_mesg_defs[FIT_MESG_FIT_MESG_DEVICE_INFO as usize] as *const u8,
+//             FIT_DEVICE_INFO_MESG_DEF_SIZE as u16,
+//             fp,
+//         )?;
+    
+//         write_message(
+//             local_mesg_number,
+//             &device_info_mesg as *const _ as *const u8,
+//             size_of::<FIT_DEVICE_INFO_MESG>() as u16,
+//             fp,
+//         )?;
+//     }
+
+//     Ok(())
+// }
+
+	// Write Activity message.
+	// {
+	// 	FIT_UINT8 local_mesg_number = 0;
+	// 	FIT_ACTIVITY_MESG activity_mesg;
+	// 	Fit_InitMesg(fit_mesg_defs[FIT_MESG_ACTIVITY], &activity_mesg);
+
+	// 	activity_mesg.timestamp = timestamp;
+	// 	activity_mesg.num_sessions = 1;
+	// 	activity_mesg.total_timer_time = (timestamp - start_time) * 1000;
+
+	// 	int timezoneOffset = -7 * 3600;
+	// 	activity_mesg.local_timestamp = timestamp + timezoneOffset;
+
+	// 	WriteMessageDefinition(local_mesg_number, fit_mesg_defs[FIT_MESG_ACTIVITY], FIT_ACTIVITY_MESG_DEF_SIZE, fp);
+	// 	WriteMessage(local_mesg_number, &activity_mesg, FIT_ACTIVITY_MESG_SIZE, fp);
+	// }
+
+
+// fn write_activity_mesg(
+//     timestamp: u32,
+//     fp: *mut FILE,
+// ) ->  Result<(), std::io::Error> {
+//     let local_mesg_number: u8 = 0;
+
+//     unsafe {
+//         let mut activity_mesg = FIT_ACTIVITY_MESG {
+//             timestamp,
+//             num_sessions: 1,
+//             total_timer_time: (timestamp - timestamp) * 1000,
+//             local_timestamp: (timestamp as i32 + 1) as u32,
+//             type_: 1,
+//             event: 1,
+//             event_type: 1,
+//             event_group: 1,
+//         };
+    
+//         // Fit_InitMesg(fit_mesg_defs[FIT_MESG_FIT_MESG_ACTIVITY as usize], &mut activity_mesg as *const FIT_ACTIVITY_MESG as *mut c_void);
+    
+//         write_message_definition(
+//             local_mesg_number,
+//             fit_mesg_defs[FIT_MESG_FIT_MESG_ACTIVITY as usize] as *const u8,
+//             FIT_ACTIVITY_MESG_DEF_SIZE as u16,
+//             fp,
+//         )?;
+    
+//         write_message(
+//             local_mesg_number,
+//             &activity_mesg as *const _ as *const u8,
+//             size_of::<FIT_ACTIVITY_MESG>() as u16,
+//             fp,
+//         )?;
+//     }
+
+//     Ok(())
+// }
+
+
+    // let fp = &mut File::create("test.fit").unwrap();
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+
+    let filename = CString::new("x.fit").expect("CString::new failed");
+    let mode = CString::new("w+b").expect("CString::new failed");
+    unsafe {
+
+        let fp = fopen(filename.as_ptr(), mode.as_ptr());
+        let _ = write_file_header(fp).unwrap();
+
+        // let _ = write_file_id_message(timestamp, fp);
+
+        // fwrite(&DATA_CRC.lock().unwrap() as *const _ as *const c_void, 1, size_of::<u16>(), fp);
+        // println!("{:?} - final crc", &DATA_CRC.lock().unwrap());
+
+        let _ = write_file_header(fp).unwrap();
+    }
+
+    // let _ = write_file_id_message(timestamp, fp);
+    // let _ = write_device_info_mesg(timestamp, fp);
+    // let _ = write_activity_mesg(timestamp, fp);
+
+    // println!("{:?} - data_crc", &DATA_CRC.lock().unwrap());
+    // let _ = fp.write_all(&DATA_CRC.lock().unwrap().to_le_bytes());
+
+    // let _ = write_file_header(fp).unwrap();
